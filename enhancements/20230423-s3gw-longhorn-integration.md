@@ -1,12 +1,12 @@
 # Title
 
-s3gw integration with Longhorn
+Object Support for Longhorn
 
 ## Summary
 
-By integrating s3gw with Longhorn, we are able to provide an S3-compliant API to
-clients consuming Longhorn volumes. This is achieved by creating an S3 endpoint
-(using s3gw) for a Longhorn volume.
+By integrating s3gw with Longhorn, we are able to provide an S3-compatible,
+Object API to clients consuming Longhorn volumes. This is achieved by creating
+an Object endpoint (using s3gw) for a Longhorn volume.
 
 ### Related Issues
 
@@ -17,23 +17,26 @@ https://github.com/longhorn/longhorn/issues/4154
 
 ### Goals
 
-* Provide an S3 endpoint associated with a Longhorn volume.
-* Multiple S3 endpoints should be supported, with each endpoint being backed by
-  one single Longhorn volume.
+* Provide an Object endpoint associated with a Longhorn volume, providing an
+  S3-compatible API.
+* Multiple Object endpoints should be supported, with each endpoint being backed
+  by one single Longhorn volume.
 
 
 ### Non-goals
 
 * Integration of s3gw UI for administration and management purposes. Such an
   Enhancement Proposal should be a standalone LEP by its own right.
-* Providing S3 endpoints for multiple volumes. In this proposal we limit one s3
-  endpoint per Longhorn volume.
-* Multiple S3 endpoints for a single volume, either in Read-Write Many, or as
-  active/passive for HA failover.
+* Providing Object endpoints for multiple volumes. In this proposal we limit one
+  object endpoint per Longhorn volume (see longhorn/longhorn#5444).
+* Multiple Object endpoints for a single volume, either in Read-Write Many, or
+  as active/passive for HA failover. While we believe it to be of the utmost
+  importance, we are considering it future work that should be addressed in its
+  own LEP.
+* Specify how COSI can be implemented for Longhorn and s3gw. This too should be
+  addressed in a specific LEP.
 
 ## Proposal
-
-This is where we get down to the nitty-gritty of what the proposal actually is.
 
 ### User Stories
 
@@ -49,32 +52,60 @@ user to install additional dependencies or manage different applications.
 
 ### User Experience In Detail
 
-* Using the Longhorn UI, user clicks on "Create Volume";
-* User fills the various fields according to their desire;
-* User selects S3 as the Frontend;
-    * Access Mode becomes fixed at "Read-Write Once";
-* User clicks "Ok".
+* A new "Create Object Endpoint" button exists in the Volumes page;
+* The user clicks on "Create Object Endpoint";
+* A modal dialog is shown, with the various Object Endpoint/s3gw related fields;
+* User specifies the endpoint name;
+* User specifies their username and password combination for the administrator
+  user;
+    * This can, potentially, be randomly generated as well.
+* For publicly accessible endpoints, the user must specify a domain name to be
+  used;
+* The user must provide SSL certificates to be used by the endpoint.
+* Then the user clicks "Ok".
 
 ### API changes
 
-The API will need to understand a new `s3` parameter for the `Frontend` field
-during volume creation.
+The API will need a new endpoint to create an object endpoint, as well as
+listing, updating, and deleting them. We believe it's not reasonable to reuse
+the existing `/v1/volumes` API endpoints, given they are semantically distinct
+from what we are trying to achieve.
+
+We thus propose the creation of a `/v1/endpoint/object` API endpoint. This route
+could also be `/v1/object-endpoint`, but we believe that by having a
+`/v1/endpoint/...` route we can potentially future proof the API in case other
+endpoint types (not just object) are eventually added.
+
 
 ## Design
 
 ### Implementation Overview
 
-We believe changes to be required in various ways:
+Integrating Longhorn with `s3gw` will require the creation of mechanisms that
+allow us to 1) describe an object endpoint; 2) create a volume to be used for
+storage; 3) deploy an `s3gw` pod consuming the created volume; and 4) deploy an
+`s3gw-ui` pod for management and administration.
 
-* Creating a new `S3Endpoint` Custom Resource Definition;
-* Enabling `s3` as a new Frontend for volume creation;
-* Creating a new `S3Endpoint` resource (via `client-go` API) with the new s3
-  endpoint associated with the newly created volume;
-* Creating a `controller/s3endpoint_controller.go`, defining a new
-  `S3EndpointController`;
-* Listening for new `S3Endpoint` resources in `S3EndpointController`, creating a
-  new `Service` and a new `Pod`.
+We believe we will need a new Custom Resource Definition, `ObjectEndpoint`,
+representing an Object Endpoint deployment, containing information that will be
+required to deploy an `s3gw` endpoint, as well as the `s3gw-ui` administration
+interface.
 
+Given we require a volume to be created before deploying an `s3gw` instance, we
+will need to first trigger volume creation ourselves, meaning creating a new
+`longhorn.VolumeSpec` using the parameters we believe to be necessary for proper
+`s3gw` execution, and calling on `VolumeManager.Create()` for volume creation.
+
+Having a volume, we can create a new `ObjectEndpoint`, including the volume to
+be used. The `ObjectEndpointSpec` will thus include the volume to be claimed,
+credentials to be used for the administration interface, SSL certificates,
+amongst other things we may need to define at a later stage.
+
+An `ObjectEndpointController` will also be necessary, responsible for creating
+and managing `s3gw` pods, both the `s3gw` endpoint and the `s3gw-ui`. This
+controller will be listening for new resources of type `objectendpoint`, and
+will create the necessary bits for proper deployment, including services and
+pods.
 
 #### Custom Resource Definition
 
@@ -83,34 +114,43 @@ following the implementation for the existing `ShareManager`, something similar
 would likely be desired.
 
 ```golang
-longhorn.S3Endpoint{
+longhorn.ObjectEndpoint{
     ObjectMeta: metav1.ObjectMeta{
-        Name: volume.Name,
-        Namespace: volume.Namespace
+        Name: <string>
     },
-    Spec: longhorn.S3EndpointSpec{
+    Spec: longhorn.ObjectEndpointSpec{
         Image: <s3gw-image-name>,
-        ImageUI: <s3gw-ui-image-name>
+        ImageUI: <s3gw-ui-image-name>,
+        Credentials: longhorn.ObjectEndpointCredentials {
+            AccessKey: <string>,
+            SecretKey: <string>,
+        },
+        PublicDomain: <string>,
+        SSLCertificate: <base64-string>,
+        Volume: <string>,
     }
 }
 ```
 
 #### Required changes
 
-We expect to need to perform the following changes to `longhorn-manager`:
+Aside from what has been discussed previously, we believe we need to add two new
+options as arguments to `longhorn-manager`: `--object-endpoint-image`, and
+`--object-endpoint-ui-image`, both expecting their corresponding image names.
+These will be essential for us to be able to spin up the pods for the object
+endpoints being deployed.
 
-* Introduce two new arguments: `--s3-endpoint-image <image>`, and `--s3-endpoint-image-ui`;
-* Create a new `S3EndpointController` in
-  `controllers/s3_endpoint_controller.go`, responsible for creating and managing
-  `s3gw` pods;
-* Add `S3EndpointController` to `controller/controller_manager.go`'s
-  `StartControllers()`;
-* Introduce a new `S3EndpointInformer` to `DataStore`;
-* Create new functions `ReconcileS3EndpointState()` and
-  `createS3EndpointForVolume()` in `controller/volume_controller.go`;
-* Create new function `CreateS3Endpoint()` in `datastore/longhorn.go`.
+Additionally, we will require to add the new `ObjectEndpointController` to
+`StartControllers()`, in `controller/controller_manager.go`.
 
-Additionally, we expect to add `s3gw` images as dependencies to be downloaded by
+A new informer will need to be created as well, `ObjectEndpointInformer`, adding
+it to the `DataStore`, so we can listen for `ObjectEndpoint` resources, which we
+will critically need to in the `ObjectEndpointController`.
+
+A new function `ReconcileObjectEndpointState()` may be desirable, to be called
+from `VolumeController.syncVolume()`, in `controller/volume_controller.go`.
+
+Finally, we expect to add `s3gw` images as dependencies to be downloaded by
 the Longhorn chart.
 
 Further changes may be needed as development evolves.
@@ -124,8 +164,20 @@ appreciated.
 ### Upgrade strategy
 
 Upgrading to this enhancement should be painless. Once this feature is available
-in Longhorn, the user should be able to create new Volumes with the S3 Frontend
-without much else to do.
+in Longhorn, the user should be able to create new object endpoints without much
+else to do.
+
+At this stage it is not clear how upgrades between Longhorn versions will
+happen. We expect to be able to simply restart existing pods using new images.
+
+### Versioning
+
+Including the `s3gw` containers in the Longhorn chart means that, for a specific
+Longhorn version, only a specific `s3gw` version is expected to have been tested
+and be in working condition. We don't make assumptions as to whether other
+`s3gw` versions would correctly function.
+
+An upgrade to `s3gw` will require an upgrade to Longhorn.
 
 ## Note
 
@@ -138,10 +190,10 @@ applied to `s3gw`.
 %%{init: {"flowchart": {"defaultRenderer": "elk"}} }%%
 graph TB
 
-    uiapi -- "/v1/volumes/{name}?action=pvCreate" --> apirouter(api/router.go)
+    uiapi ---> apirouter(api/router.go)
 
     subgraph UI
-        uicpv(CreatePVAndPVCSingle.js) -- set accessMode to rwx --> uiapi((UI API))
+        uicpv(CreateVolume.js) ---> uiapi((UI API))
     end
 
     subgraph LM
@@ -194,9 +246,7 @@ graph TB
                 k8screatesm{{REST call<br>POST<br>Resource sharemanagers}}
 
                 dscreatesm --> k8screatesm
-            end
-
-            subgraph datastore/volume.go
+            
                 dscreatevol["CreateVolume()"]
                 dslabelcreatevol{{"Create Volume<br>via LonghornV1beta2()"}}
                 dscreatevol --- dslabelcreatevol
